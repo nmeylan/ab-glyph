@@ -5,9 +5,15 @@ use crate::{point, Font, GlyphId, InvalidFont, Outline, Point, Rect};
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use core::borrow::BorrowMut;
 use core::convert::TryFrom;
 use core::fmt;
-use owned_ttf_parser::{self as ttfp, AsFaceRef};
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::iter::Map;
+use std::sync::{Arc, RwLock};
+use owned_ttf_parser::{self as ttfp, AsFaceRef, Face, OwnedFace, PreParsedSubtables};
 
 impl From<GlyphId> for ttfp::GlyphId {
     #[inline]
@@ -68,7 +74,21 @@ pub enum GlyphImageFormat {
 /// # Ok(()) }
 /// ```
 #[derive(Clone)]
-pub struct FontRef<'font>(ttfp::PreParsedSubtables<'font, ttfp::Face<'font>>);
+pub struct FontCache {
+    cache: HashMap<char, GlyphId>,
+    ascent_unscaled: f32,
+    descent_unscaled: f32,
+    line_gap_unscaled: f32,
+}
+
+impl FontCache {
+    pub fn get_glyph_id(&self, c: char) -> Option<&GlyphId> {
+        self.cache.get(&c)
+    }
+}
+
+#[derive(Clone)]
+pub struct FontRef<'font>(ttfp::PreParsedSubtables<'font, ttfp::Face<'font>>, FontCache);
 
 impl fmt::Debug for FontRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -109,9 +129,11 @@ impl<'font> FontRef<'font> {
     /// ```
     #[inline]
     pub fn try_from_slice_and_index(data: &'font [u8], index: u32) -> Result<Self, InvalidFont> {
-        Ok(Self(ttfp::PreParsedSubtables::from(
+        let pre_parsed_subtables = ttfp::PreParsedSubtables::from(
             ttfp::Face::from_slice(data, index).map_err(|_| InvalidFont)?,
-        )))
+        );
+        let cache = font_init(&pre_parsed_subtables);
+        Ok(Self(pre_parsed_subtables, cache))
     }
 }
 
@@ -131,7 +153,7 @@ impl<'font> FontRef<'font> {
 /// assert_eq!(font.glyph_id('s'), ab_glyph::GlyphId(56));
 /// # Ok(()) }
 /// ```
-pub struct FontVec(ttfp::PreParsedSubtables<'static, ttfp::OwnedFace>);
+pub struct FontVec(ttfp::PreParsedSubtables<'static, ttfp::OwnedFace>, FontCache);
 
 impl fmt::Debug for FontVec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -173,12 +195,34 @@ impl FontVec {
     /// ```
     #[inline]
     pub fn try_from_vec_and_index(data: Vec<u8>, index: u32) -> Result<Self, InvalidFont> {
-        Ok(Self(ttfp::PreParsedSubtables::from(
+        let pre_parsed_subtables = ttfp::PreParsedSubtables::from(
             ttfp::OwnedFace::from_vec(data, index).map_err(|_| InvalidFont)?,
-        )))
+        );
+        let cache = font_init(&pre_parsed_subtables);
+        Ok(Self(pre_parsed_subtables, cache))
     }
 }
 
+
+fn font_init<F>(pre_parsed_subtables: &PreParsedSubtables<F>) -> FontCache
+    where F: AsFaceRef {
+    let chars_str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789#+*ç%&/()=?`~'-.,;:_<>!¨$€\\/\"|§°[]{}üèöé \n\t\r";
+    let chars = chars_str.chars();
+    let mut glyph_index_cache = HashMap::<char, GlyphId>::with_capacity(chars_str.len());
+    chars
+        .for_each(|c| {
+            let maybe_glyph_index = pre_parsed_subtables.glyph_index(c);
+            if maybe_glyph_index.is_some() {
+                glyph_index_cache.insert(c, GlyphId(maybe_glyph_index.map(|id| id.0).unwrap_or(0)));
+            }
+        });
+    FontCache {
+        cache: glyph_index_cache,
+        ascent_unscaled: pre_parsed_subtables.as_face_ref().ascender().into(),
+        descent_unscaled: pre_parsed_subtables.as_face_ref().descender().into(),
+        line_gap_unscaled: pre_parsed_subtables.as_face_ref().line_gap().into(),
+    }
+}
 /// Implement `Font` for `Self(AsFontRef)` types.
 macro_rules! impl_font {
     ($font:ty) => {
@@ -191,24 +235,29 @@ macro_rules! impl_font {
 
             #[inline]
             fn ascent_unscaled(&self) -> f32 {
-                self.0.as_face_ref().ascender().into()
+                self.1.ascent_unscaled
             }
 
             #[inline]
             fn descent_unscaled(&self) -> f32 {
-                self.0.as_face_ref().descender().into()
+                self.1.descent_unscaled
             }
 
             #[inline]
             fn line_gap_unscaled(&self) -> f32 {
-                self.0.as_face_ref().line_gap().into()
+                self.1.line_gap_unscaled
             }
 
             #[inline]
             fn glyph_id(&self, c: char) -> GlyphId {
                 // Note: Using `PreParsedSubtables` method for better performance.
-                let index = self.0.glyph_index(c).map(|id| id.0).unwrap_or(0);
-                GlyphId(index)
+                let maybe_cached_index = self.1.get_glyph_id(c);
+                if maybe_cached_index.is_some() {
+                    maybe_cached_index.unwrap().clone()
+                } else {
+                   let index = self.0.glyph_index(c).map(|id| id.0).unwrap_or(0);
+                   GlyphId(index)
+                }
             }
 
             #[inline]
